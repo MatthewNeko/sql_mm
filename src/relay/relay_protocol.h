@@ -25,8 +25,9 @@ constexpr uint16_t kProtocolVersion = 2;
 
 // Cap on a single frame the client is willing to buffer. The server enforces
 // its own limit; this one protects the game process from a hostile/garbled
-// length prefix.
-constexpr uint32_t kDefaultMaxPayloadBytes = 64u * 1024u * 1024u;
+// length prefix. Matches the relay's default max_payload_bytes; frames are
+// fully buffered, so a large value costs memory in the game process too.
+constexpr uint32_t kDefaultMaxPayloadBytes = 16u * 1024u * 1024u;
 
 // Handshake nonce length. 32 bytes because it is also the HKDF salt material.
 constexpr size_t kNonceBytes = 32;
@@ -55,8 +56,14 @@ enum class Message : uint8_t
 
 enum FeatureFlags : uint32_t
 {
-    // The server session runs with sql_mode NO_BACKSLASH_ESCAPES, so
-    // Escape() must double quotes instead of using backslash escapes.
+    // Legacy. Old relays used to report this when the MySQL server ran with
+    // sql_mode NO_BACKSLASH_ESCAPES, and Escape() switched to '' quoting.
+    //
+    // Current relays do not send it: they clear the flag on their own session
+    // and refuse the session (with an error) when they cannot, so backslash
+    // escaping is guaranteed to be correct on every connection this client can
+    // successfully open. Escape() still honours the bit, for relays built
+    // before that change.
     FeatureNoBackslashEscapes = 1u << 0,
 };
 

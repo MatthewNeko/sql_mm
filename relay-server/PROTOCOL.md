@@ -95,7 +95,12 @@ Feature flags in `CONNECT_OK`:
 
 | bit | name | meaning |
 | --- | --- | --- |
-| 0 | `NO_BACKSLASH_ESCAPES` | Session `sql_mode` disables backslash escapes; the plugin must double quotes when escaping. |
+| 0 | `NO_BACKSLASH_ESCAPES` | Legacy: the session's `sql_mode` disables backslash escapes, so the plugin must double quotes when escaping. |
+
+Current relays never set bit 0: they clear `NO_BACKSLASH_ESCAPES` on their own
+session and answer `CONNECT` with an `ERROR` when that is impossible, so the
+plugin can rely on backslash escaping on every session it successfully opens.
+The bit stays in the protocol so an older relay keeps working.
 
 ## Requests
 

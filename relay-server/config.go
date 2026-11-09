@@ -1,13 +1,31 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"strings"
 	"time"
 )
+
+// maxPayloadCeiling is the hard limit for max_payload_bytes. Every concurrently
+// connected session can be holding one payload in flight, so the configured
+// value multiplies by max_sessions: 16 MiB x 64 sessions is already 1 GiB of
+// peak transient memory.
+const maxPayloadCeiling = 256 << 20
+
+// minReadTimeout is the floor applied to the MySQL socket read timeout. A zero
+// (or absurdly small) value lets a single stalled query pin a session, its
+// worker goroutine and its MySQL connection forever.
+const minReadTimeout = 120 * time.Second
+
+// defaultMaxPayload is deliberately smaller than the old 64 MiB: relay frames
+// are fully buffered on both sides, and a result set that big is a bug on the
+// caller's side rather than something to support.
+const defaultMaxPayload = 16 << 20
 
 // DSN describes where MySQL actually lives. It is only read from the server
 // config; the plugin never sees it unless centralised credentials are off.
@@ -60,15 +78,27 @@ type Config struct {
 	// plugin passes to CreateMySQLConnection are honoured. When false, every
 	// session uses Fallback.
 	//
-	// Leave it true when each game server owns its own database, false when the
-	// relay is shared and its credentials should be the only way in.
+	// Defaults to false. Turning it on lets anyone holding the PSK point the
+	// relay at a host of their choosing, which is an SSRF primitive unless
+	// AllowedClientHosts is filled in and the peer list is tight. Leave it off
+	// when the relay is shared.
 	AllowClientDSN bool `json:"allow_client_dsn"`
 
-	// AllowedClientHosts / AllowedClientDatabases constrain what a client may
-	// ask for when AllowClientDSN is true. Empty lists mean "anything", which
-	// on an internet-facing relay is an SSRF hole: any client holding the token
-	// could point the relay at an arbitrary MySQL host. Fill them in.
-	AllowedClientHosts     []string `json:"allowed_client_hosts"`
+	// AllowedClientHosts is mandatory when AllowClientDSN is true: with an
+	// empty list every client-supplied host is refused and clients must send
+	// an empty host to use Fallback.
+	//
+	// A single "*" entry disables the check instead — explicit, because letting
+	// clients pick any host the relay can reach is a decision worth writing
+	// down. Entries may be IP literals, hostnames or Unix socket paths.
+	// Hostnames are resolved at startup; matching is done on IPs and the relay
+	// dials the IP that matched, so a DNS answer cannot change between the
+	// check and the connection.
+	AllowedClientHosts []string `json:"allowed_client_hosts"`
+
+	// AllowedClientDatabases constrains the database name a client may select.
+	// An empty list accepts any database on the allowed host; that is only
+	// reasonable when the relay's MySQL account itself is scoped to one schema.
 	AllowedClientDatabases []string `json:"allowed_client_databases"`
 
 	// AllowedPeers is a list of CIDRs permitted to connect at all. Empty means
@@ -105,19 +135,22 @@ type Config struct {
 
 func defaultConfig() *Config {
 	return &Config{
-		Listen:               "127.0.0.1:9330",
-		Encryption:           "psk",
-		Token:                "",
-		LogLevel:             "info",
-		MaxPayloadBytes:      64 * 1024 * 1024,
-		AllowClientDSN:       true,
-		Fallback:             DSN{Host: "127.0.0.1", Port: 3306},
-		DialTimeoutSeconds:   10,
-		ReadTimeoutSeconds:   60,
-		WriteTimeoutSeconds:  60,
-		QueryTimeoutSeconds:  0,
-		MaxSessions:          64,
-		MaxSessionsPerPeer:   16,
+		Listen:             "127.0.0.1:9330",
+		Encryption:         "psk",
+		Token:              "",
+		LogLevel:           "info",
+		MaxPayloadBytes:    defaultMaxPayload,
+		AllowClientDSN:     false,
+		Fallback:           DSN{Host: "127.0.0.1", Port: 3306},
+		DialTimeoutSeconds: 10,
+		// The floor below is re-applied on load; 120s is long enough for a
+		// schema migration and short enough that a dead MySQL does not pin
+		// every session forever.
+		ReadTimeoutSeconds:  120,
+		WriteTimeoutSeconds: 60,
+		QueryTimeoutSeconds: 0,
+		MaxSessions:         64,
+		MaxSessionsPerPeer:  16,
 	}
 }
 
@@ -137,13 +170,13 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.Listen = defaultConfig().Listen
 	}
 	if cfg.MaxPayloadBytes <= 0 {
-		cfg.MaxPayloadBytes = defaultConfig().MaxPayloadBytes
+		cfg.MaxPayloadBytes = defaultMaxPayload
 	}
 	if cfg.DialTimeoutSeconds <= 0 {
 		cfg.DialTimeoutSeconds = 10
 	}
 	if cfg.ReadTimeoutSeconds <= 0 {
-		cfg.ReadTimeoutSeconds = 60
+		cfg.ReadTimeoutSeconds = int(minReadTimeout / time.Second)
 	}
 	if cfg.WriteTimeoutSeconds <= 0 {
 		cfg.WriteTimeoutSeconds = 60
@@ -170,6 +203,12 @@ func LoadConfig(path string) (*Config, error) {
 // once. Kept separate from LoadConfig so tests (and future callers that build a
 // Config by hand) get the same checks.
 func (cfg *Config) finalize() error {
+	// Frames are fully buffered on both sides, so the configured payload size
+	// multiplies by the number of live sessions.
+	if cfg.MaxPayloadBytes > maxPayloadCeiling {
+		return fmt.Errorf("max_payload_bytes %d exceeds the %d byte ceiling (each session buffers one frame)",
+			cfg.MaxPayloadBytes, maxPayloadCeiling)
+	}
 	switch strings.ToLower(strings.TrimSpace(cfg.Encryption)) {
 	case "", "psk":
 		cfg.Encryption = "psk"
@@ -188,14 +227,67 @@ func (cfg *Config) finalize() error {
 	case "none":
 		cfg.Encryption = "none"
 		cfg.sessionKey = nil
+		// An unauthenticated SQL proxy on a public interface is not a
+		// misconfiguration worth tolerating: anyone who can reach the port can
+		// run queries as the relay's MySQL user.
+		if err := cfg.checkPlaintextListen(); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("encryption: unknown mode %q (use \"psk\" or \"none\")", cfg.Encryption)
 	}
 	return nil
 }
 
+// checkPlaintextListen refuses encryption=none unless the relay only accepts
+// loopback connections. Re-run it after the listen address is overridden on
+// the command line.
+func (cfg *Config) checkPlaintextListen() error {
+	if cfg.Encryption != "none" {
+		return nil
+	}
+	if isLoopbackListen(cfg.Listen) {
+		return nil
+	}
+	return fmt.Errorf("encryption=none is only allowed on a loopback listen address (got %q); "+
+		"use encryption=psk for anything reachable from the network", cfg.Listen)
+}
+
+func isLoopbackListen(addr string) bool {
+	host := addr
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		host = h
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func (c *Config) dialTimeout() time.Duration {
 	return time.Duration(c.DialTimeoutSeconds) * time.Second
+}
+
+// connLimit bounds the number of TCP connections the process will hold at once,
+// handshakes included. It is deliberately larger than MaxSessions so a game
+// server that reconnects before the old socket is reaped is not refused.
+func (c *Config) connLimit() int {
+	return c.MaxSessions*2 + 16
+}
+
+// redact removes internal addresses from text that is about to be logged or
+// returned to a client. Non-empty secrets shorter than 4 bytes are skipped so a
+// port number cannot shred unrelated digits.
+func redact(text string, secrets ...string) string {
+	for _, secret := range secrets {
+		secret = strings.TrimSpace(secret)
+		if len(secret) < 4 {
+			continue
+		}
+		text = strings.ReplaceAll(text, secret, "[mysql]")
+	}
+	return text
 }
 
 func (c *Config) queryTimeout() time.Duration {
@@ -250,34 +342,164 @@ func (f *PeerFilter) Allows(ip net.IP) bool {
 	return false
 }
 
-// clientDSNAllowed validates a plugin-supplied DSN against the allowlists.
+// clientDSNAllowed validates the database half of a plugin-supplied DSN. The
+// host half is handled by ClientHostFilter, which also returns the address the
+// relay must dial (see Canonical).
 func (c *Config) clientDSNAllowed(req dsnRequest) error {
 	if !c.AllowClientDSN {
 		return nil
 	}
-	if len(c.AllowedClientHosts) > 0 {
-		ok := false
-		for _, host := range c.AllowedClientHosts {
-			if strings.EqualFold(strings.TrimSpace(host), req.Host) {
-				ok = true
-				break
-			}
-		}
-		if !ok {
-			return fmt.Errorf("client requested an unlisted host %q", req.Host)
+	if len(c.AllowedClientDatabases) == 0 {
+		return nil
+	}
+	for _, db := range c.AllowedClientDatabases {
+		if strings.EqualFold(strings.TrimSpace(db), req.Database) {
+			return nil
 		}
 	}
-	if len(c.AllowedClientDatabases) > 0 {
-		ok := false
-		for _, db := range c.AllowedClientDatabases {
-			if strings.EqualFold(strings.TrimSpace(db), req.Database) {
-				ok = true
-				break
-			}
+	return fmt.Errorf("client requested an unlisted database %q", req.Database)
+}
+
+// clientHostEntry is one allowed_client_hosts entry after normalisation. text
+// keeps the configured spelling (needed for Unix socket paths and for names
+// that cannot be resolved at startup); ip is set for every address the entry
+// stands for.
+type clientHostEntry struct {
+	text string
+	ip   net.IP
+	unix bool
+}
+
+// ClientHostFilter validates and canonicalises the host a plugin asks the relay
+// to dial.
+//
+// The comparison is done on addresses, not on strings: "localhost" and
+// "127.0.0.1" denote the same host, and a name that resolves into the allowlist
+// must not become a way to make the relay dial something else. The address that
+// matched is what gets dialled, so a DNS answer cannot be swapped between the
+// check and the connection.
+type ClientHostFilter struct {
+	entries []clientHostEntry
+	// closed means no allowlist was configured. Every client-supplied host is
+	// then refused; the client must pass an empty host to use Fallback.
+	closed bool
+	// any is set by an explicit "*" entry: every host is allowed. Spelled out
+	// rather than implied by an empty list, because turning the check off is a
+	// decision that should be visible in the config file.
+	any bool
+}
+
+// NewClientHostFilter resolves the configured entries once at startup.
+func NewClientHostFilter(entries []string) *ClientHostFilter {
+	f := &ClientHostFilter{closed: len(entries) == 0}
+	for _, raw := range entries {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			continue
 		}
-		if !ok {
-			return fmt.Errorf("client requested an unlisted database %q", req.Database)
+		if entry == "*" {
+			f.any = true
+			continue
+		}
+		if strings.HasPrefix(entry, "/") {
+			// Unix socket path.
+			f.entries = append(f.entries, clientHostEntry{text: entry, unix: true})
+			continue
+		}
+		if ip := net.ParseIP(entry); ip != nil {
+			f.entries = append(f.entries, clientHostEntry{text: entry, ip: ip})
+			continue
+		}
+		ips, err := lookupIPs(entry)
+		if err != nil || len(ips) == 0 {
+			// Keep it as an exact-match name; Canonical falls back to string
+			// comparison when the client's host cannot be resolved either.
+			f.entries = append(f.entries, clientHostEntry{text: strings.ToLower(entry)})
+			continue
+		}
+		for _, ip := range ips {
+			f.entries = append(f.entries, clientHostEntry{text: strings.ToLower(entry), ip: ip})
 		}
 	}
-	return nil
+	return f
+}
+
+// Canonical returns the address the relay should dial for a client-supplied
+// host, or an error when that host is not on the allowlist.
+func (f *ClientHostFilter) Canonical(host string) (string, error) {
+	if host == "" {
+		return "", errors.New("empty host")
+	}
+	if f == nil || f.closed {
+		return "", errors.New("this relay does not accept client supplied hosts; " +
+			"send an empty host to use the relay's own database")
+	}
+	if f.any {
+		// Nothing to pin the check to, so dial the name as given. The database
+		// allowlist and the MySQL account's own grants are the only limits
+		// left; the relay logs a warning at startup.
+		return host, nil
+	}
+	if strings.HasPrefix(host, "/") {
+		for _, e := range f.entries {
+			if e.unix && e.text == host {
+				return host, nil
+			}
+		}
+		return "", fmt.Errorf("client requested an unlisted socket %q", host)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		for _, e := range f.entries {
+			if e.ip != nil && e.ip.Equal(ip) {
+				return ip.String(), nil
+			}
+		}
+		return "", fmt.Errorf("client requested an unlisted host %q", host)
+	}
+	// A name: resolve it, then match the answers against the allowlist. The
+	// matched address is dialled, not the name, so a second lookup cannot
+	// point somewhere else.
+	ips, err := lookupIPs(host)
+	if err == nil {
+		for _, ip := range ips {
+			for _, e := range f.entries {
+				if e.ip != nil && e.ip.Equal(ip) {
+					return ip.String(), nil
+				}
+			}
+		}
+	}
+	for _, e := range f.entries {
+		if e.text == strings.ToLower(host) {
+			return host, nil
+		}
+	}
+	return "", fmt.Errorf("client requested an unlisted host %q", host)
+}
+
+func lookupIPs(host string) ([]net.IP, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		return []net.IP{ip}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return net.DefaultResolver.LookupIP(ctx, "ip", host)
+}
+
+// connectErrText renders a dial/login failure for the plugin. The reason is
+// useful ("access denied", "unknown database") but the message must not carry
+// the internal MySQL address, because the plugin log is usually less protected
+// than this process.
+func (c *Config) connectErrText(err error, req dsnRequest, dialHost string) string {
+	if err == nil {
+		return ""
+	}
+	secrets := []string{c.Fallback.Host, fmt.Sprintf("%s:%d", c.Fallback.Host, c.Fallback.Port)}
+	if dialHost != "" {
+		secrets = append(secrets, dialHost, net.JoinHostPort(dialHost, fmt.Sprintf("%d", req.Port)))
+	}
+	if req.Host != "" {
+		secrets = append(secrets, req.Host)
+	}
+	return truncateForLog(redact(fmt.Sprintf("%v", err), secrets...), 400)
 }

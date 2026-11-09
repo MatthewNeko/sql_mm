@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 const relayVersion = "2.0.0"
@@ -54,6 +55,7 @@ type Server struct {
 	active atomic.Int32
 	nextID atomic.Uint64
 	peers  *PeerFilter
+	hosts  *ClientHostFilter
 
 	peerMu       sync.Mutex
 	peerSessions map[string]int
@@ -64,13 +66,26 @@ func NewServer(cfg *Config, logger *log.Logger) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{
+	s := &Server{
 		cfg:          cfg,
 		level:        parseLevel(cfg.LogLevel),
 		logger:       logger,
 		peers:        peers,
 		peerSessions: make(map[string]int),
-	}, nil
+	}
+	if cfg.AllowClientDSN {
+		s.hosts = NewClientHostFilter(cfg.AllowedClientHosts)
+		if s.hosts.closed {
+			s.logf(lvlWarn, "allow_client_dsn is on but allowed_client_hosts is empty: "+
+				"every client supplied host will be refused, clients must send an empty host")
+		}
+		if s.hosts.any {
+			s.logf(lvlWarn, "allowed_client_hosts is [\"*\"]: any MySQL host reachable from this process "+
+				"can be dialled by a client holding the PSK; the database allowlist and the MySQL "+
+				"account's grants are the only limits left")
+		}
+	}
+	return s, nil
 }
 
 func (s *Server) tryAcquirePeer(key string) bool {
@@ -129,12 +144,20 @@ func (s *Server) Serve(ln net.Listener) error {
 	if !s.encrypted() {
 		mode = "PLAIN TEXT"
 	}
-	s.logf(lvlInfo, "relay listening on %s (%s, client dsn %v, max payload %d bytes, max sessions %d, peers %s)",
-		ln.Addr(), mode, s.cfg.AllowClientDSN, s.cfg.MaxPayloadBytes, s.cfg.MaxSessions, describePeers(s.cfg.AllowedPeers))
+	s.logf(lvlInfo, "relay listening on %s (%s, client dsn %v, max payload %d bytes, max sessions %d, max conns %d, peers %s)",
+		ln.Addr(), mode, s.cfg.AllowClientDSN, s.cfg.MaxPayloadBytes, s.cfg.MaxSessions, s.cfg.connLimit(),
+		describePeers(s.cfg.AllowedPeers))
 	if !s.encrypted() {
 		s.logf(lvlWarn, "encryption is off: tokens, SQL and result sets cross the network in clear text")
 	}
+	if s.cfg.AllowClientDSN && len(s.cfg.AllowedClientDatabases) == 0 {
+		s.logf(lvlWarn, "allow_client_dsn is on without allowed_client_databases: any schema the relay's account can reach is selectable")
+	}
 
+	// slots bounds goroutines and file descriptors. Without it a flood of bare
+	// TCP connects (never completing a handshake) still costs one goroutine and
+	// one socket each until the read deadline fires.
+	slots := make(chan struct{}, s.cfg.connLimit())
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -144,7 +167,17 @@ func (s *Server) Serve(ln net.Listener) error {
 			}
 			return err
 		}
-		go s.handleConn(conn)
+		select {
+		case slots <- struct{}{}:
+		default:
+			s.logf(lvlWarn, "%s: connection limit (%d) reached, dropping", conn.RemoteAddr(), cap(slots))
+			conn.Close()
+			continue
+		}
+		go func(c net.Conn) {
+			defer func() { <-slots }()
+			s.handleConn(c)
+		}(conn)
 	}
 }
 
@@ -287,11 +320,14 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	var sess *session
 	peerHeld := false
+	slotHeld := false
 	defer func() {
 		if sess != nil {
 			sess.Close()
-			s.active.Add(-1)
 			s.logf(lvlInfo, "%s: session %d closed", remote, sess.id)
+		}
+		if slotHeld {
+			s.active.Add(-1)
 		}
 		if peerHeld {
 			s.releasePeer(peerKey)
@@ -332,18 +368,42 @@ func (s *Server) handleConn(conn net.Conn) {
 				continue
 			}
 
-			if int(s.active.Load()) >= s.cfg.MaxSessions {
+			// Claim a global slot atomically. A load-then-increment pair lets
+			// every connection in a burst pass the check before any of them
+			// increments, which is exactly how the cap gets blown.
+			if s.active.Add(1) > int32(s.cfg.MaxSessions) {
+				s.active.Add(-1)
 				fc.sendError(0, opcode, -1, "relay session limit reached")
 				continue
 			}
+			slotHeld = true
+
+			// The host is validated before the slot is spent on a dial: a
+			// refused DSN must not be able to occupy the session budget.
+			dialHost := ""
+			if s.cfg.AllowClientDSN && req.Host != "" {
+				canonical, err := s.hosts.Canonical(req.Host)
+				if err != nil {
+					s.active.Add(-1)
+					slotHeld = false
+					s.logf(lvlWarn, "%s: refused DSN host: %v", remote, err)
+					fc.sendError(0, opcode, -1, errText(err))
+					continue
+				}
+				dialHost = canonical
+			}
 
 			if err := s.cfg.clientDSNAllowed(req); err != nil {
+				s.active.Add(-1)
+				slotHeld = false
 				s.logf(lvlWarn, "%s: refused DSN: %v", remote, err)
 				fc.sendError(0, opcode, -1, errText(err))
 				continue
 			}
 
 			if !s.tryAcquirePeer(peerKey) {
+				s.active.Add(-1)
+				slotHeld = false
 				fc.sendError(0, opcode, -1, "too many sessions from this address")
 				continue
 			}
@@ -351,18 +411,25 @@ func (s *Server) handleConn(conn net.Conn) {
 			id := s.nextID.Add(1)
 			// The dial itself must be bounded even when the MySQL host black-holes.
 			ctx, cancel := context.WithTimeout(context.Background(), s.cfg.dialTimeout()+5*time.Second)
-			newSess, err := newSession(ctx, s.cfg, id, req)
+			newSess, err := newSession(ctx, s.cfg, id, req, dialHost)
 			cancel()
 			if err != nil {
 				s.releasePeer(peerKey)
-				s.logf(lvlWarn, "%s: connect failed: %v", remote, err)
-				fc.sendError(0, opcode, -1, errText(err))
+				peerHeld = false
+				s.active.Add(-1)
+				slotHeld = false
+				// Never echo the internal MySQL address to the plugin: its log
+				// usually ends up somewhere less trusted than this process.
+				msg := s.cfg.connectErrText(err, req, dialHost)
+				s.logf(lvlWarn, "%s: connect failed: %s", remote, msg)
+				fc.sendError(0, opcode, -1, msg)
 				continue
 			}
 			peerHeld = true
 			sess = newSess
-			s.active.Add(1)
-			s.logf(lvlInfo, "%s: session %d -> %s/%s", remote, id, req.Host, req.Database)
+			// %q: req.Host and req.Database are client supplied and must not be
+			// able to break the log line.
+			s.logf(lvlInfo, "%s: session %d -> %q/%q", remote, id, req.Host, req.Database)
 
 			connectOK := newWriter(msgConnectOK).
 				u32(uint32(id)).
@@ -384,11 +451,12 @@ func (s *Server) handleConn(conn net.Conn) {
 				fc.sendError(reqID, opcode, -1, "no session; send CONNECT first")
 				continue
 			}
-			s.logf(lvlDebug, "session %d query: %s", sess.id, query)
+			s.logf(lvlDebug, "session %d query: %s", sess.id, truncateForLog(query, 256))
 			st, err := sess.run(query)
 			if err != nil {
-				s.logf(lvlWarn, "session %d query error: %v", sess.id, err)
-				fc.sendError(reqID, opcode, -1, errText(err))
+				msg := sess.errText(err)
+				s.logf(lvlWarn, "session %d query error: %s", sess.id, msg)
+				fc.sendError(reqID, opcode, -1, msg)
 				continue
 			}
 			if err := fc.Send(resultWriter(reqID, []*statement{st}).buf); err != nil {
@@ -413,8 +481,9 @@ func (s *Server) handleConn(conn net.Conn) {
 			s.logf(lvlDebug, "session %d transaction with %d statements", sess.id, count)
 			stmts, failIndex, err := sess.runTransaction(queries)
 			if err != nil {
-				s.logf(lvlWarn, "session %d transaction error at %d: %v", sess.id, failIndex, err)
-				fc.sendError(reqID, opcode, failIndex, errText(err))
+				msg := sess.errText(err)
+				s.logf(lvlWarn, "session %d transaction error at %d: %s", sess.id, failIndex, msg)
+				fc.sendError(reqID, opcode, failIndex, msg)
 				continue
 			}
 			if err := fc.Send(resultWriter(reqID, stmts).buf); err != nil {
@@ -429,8 +498,9 @@ func (s *Server) handleConn(conn net.Conn) {
 		case msgClose:
 			if sess != nil {
 				sess.Close()
-				s.active.Add(-1)
 				s.logf(lvlInfo, "%s: session %d closed by client", remote, sess.id)
+				// The slot and peer reservation are released by the deferred
+				// handler; decrementing here as well would leak a slot.
 				sess = nil
 			}
 			return
@@ -446,4 +516,24 @@ func resultWriter(reqID uint32, stmts []*statement) *writer {
 	w := newWriter(msgResult)
 	writeResult(w, reqID, stmts)
 	return w
+}
+
+// oneLine collapses embedded newlines. Anything derived from client input or a
+// remote server ends up in log lines and console messages, where a newline
+// would let the far side forge extra entries.
+func oneLine(s string) string {
+	return strings.NewReplacer("\n", " ", "\r", " ").Replace(s)
+}
+
+// truncateForLog bounds a log line and keeps it on one line.
+func truncateForLog(s string, max int) string {
+	s = oneLine(s)
+	if len(s) <= max {
+		return s
+	}
+	cut := s[:max]
+	for len(cut) > 0 && !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut + "...(truncated)"
 }

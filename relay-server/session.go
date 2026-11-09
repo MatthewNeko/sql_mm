@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -64,12 +65,20 @@ type session struct {
 	// lastInsertID tracks mysql_insert_id() semantics: it survives non-INSERT
 	// statements, which is what the legacy direct-connect path exposed.
 	lastInsertID int64
+
+	// secrets are strings that must never leave the process in an error
+	// message: the real MySQL address, and the account name when it differs
+	// from what the client sent.
+	secrets []string
 }
 
-func newSession(ctx context.Context, cfg *Config, id uint64, req dsnRequest) (*session, error) {
+// newSession dials MySQL for one plugin connection. dialHost is the address
+// ClientHostFilter validated; it is empty when the client asked for the relay's
+// own database.
+func newSession(ctx context.Context, cfg *Config, id uint64, req dsnRequest, dialHost string) (*session, error) {
 	d := cfg.Fallback
-	if cfg.AllowClientDSN && req.Host != "" {
-		d = DSN{Host: req.Host, Port: int(req.Port), User: req.User, Pass: req.Pass, Database: req.Database}
+	if cfg.AllowClientDSN && req.Host != "" && dialHost != "" {
+		d = DSN{Host: dialHost, Port: int(req.Port), User: req.User, Pass: req.Pass, Database: req.Database}
 	}
 	if d.Port == 0 {
 		d.Port = 3306
@@ -91,8 +100,13 @@ func newSession(ctx context.Context, cfg *Config, id uint64, req dsnRequest) (*s
 	mc.Timeout = cfg.dialTimeout()
 
 	// Realistic reads: the plugin's MySQLConnectionInfo.timeout is the
-	// libmysqlclient read timeout, so honour it when provided.
+	// libmysqlclient read timeout, so honour it when provided. When it is not,
+	// never go below minReadTimeout — a zero socket timeout lets one stalled
+	// statement pin this session (and its goroutine) for the process lifetime.
 	ioTimeout := time.Duration(cfg.ReadTimeoutSeconds) * time.Second
+	if ioTimeout < minReadTimeout {
+		ioTimeout = minReadTimeout
+	}
 	if req.TimeoutSeconds > 0 {
 		ioTimeout = time.Duration(req.TimeoutSeconds) * time.Second
 	}
@@ -129,18 +143,97 @@ func newSession(ctx context.Context, cfg *Config, id uint64, req dsnRequest) (*s
 	}
 
 	s := &session{id: id, cfg: cfg, db: db, conn: conn}
+	if mc.Net == "tcp" {
+		s.secrets = []string{mc.Addr, d.Host}
+	} else {
+		s.secrets = []string{d.Host}
+	}
 
-	var sqlMode string
-	if err := conn.QueryRowContext(ctx, "SELECT @@SESSION.sql_mode").Scan(&sqlMode); err == nil {
-		if strings.Contains(strings.ToUpper(sqlMode), "NO_BACKSLASH_ESCAPES") {
-			s.features |= flagNoBackslashEscapes
-		}
+	if err := s.normaliseSQLMode(ctx); err != nil {
+		conn.Close()
+		db.Close()
+		return nil, err
 	}
 	if err := conn.QueryRowContext(ctx, "SELECT VERSION()").Scan(&s.version); err != nil {
 		s.version = "unknown"
 	}
 
 	return s, nil
+}
+
+// normaliseSQLMode makes the relay's escaping rules true for this session.
+//
+// The plugin escapes with backslashes: there is no live server handle on its
+// side, and mysql_real_escape_string is gone. If the server's sql_mode contains
+// NO_BACKSLASH_ESCAPES then \' does not terminate an escaped quote, and every
+// escaped literal silently becomes an injection point. Rather than trying to
+// mirror that mode over the wire, the relay drops the flag for its own session
+// and *refuses the session* if it cannot. One safe mode beats two modes that
+// have to be kept in sync across a protocol boundary.
+func (s *session) normaliseSQLMode(ctx context.Context) error {
+	var mode string
+	if err := s.conn.QueryRowContext(ctx, "SELECT @@SESSION.sql_mode").Scan(&mode); err != nil {
+		return fmt.Errorf("cannot read sql_mode, refusing a session whose escaping rules are unknown: %w", err)
+	}
+	if !strings.Contains(strings.ToUpper(mode), "NO_BACKSLASH_ESCAPES") {
+		return nil
+	}
+
+	cleaned, _ := removeSQLMode(mode, "NO_BACKSLASH_ESCAPES")
+	// sql_mode is a comma separated list of identifiers. Validate that shape
+	// and splice it in, rather than relying on a parameter marker inside SET
+	// (which not every server/proxy combination accepts).
+	if !isSQLModeList(cleaned) {
+		return fmt.Errorf("sql_mode %q is not a plain list of modes, refusing to rewrite it", mode)
+	}
+	if _, err := s.conn.ExecContext(ctx, "SET SESSION sql_mode = '"+cleaned+"'"); err != nil {
+		return fmt.Errorf("server sql_mode has NO_BACKSLASH_ESCAPES and SET SESSION sql_mode failed; "+
+			"backslash escaping would be unsafe on this session: %w", err)
+	}
+
+	// Verify rather than trust: a proxy or a read-only replica can accept the
+	// statement and ignore it.
+	var verified string
+	if err := s.conn.QueryRowContext(ctx, "SELECT @@SESSION.sql_mode").Scan(&verified); err != nil {
+		return fmt.Errorf("cannot verify sql_mode after clearing NO_BACKSLASH_ESCAPES: %w", err)
+	}
+	if strings.Contains(strings.ToUpper(verified), "NO_BACKSLASH_ESCAPES") {
+		return errors.New("server kept NO_BACKSLASH_ESCAPES after SET SESSION sql_mode; " +
+			"backslash escaping would be unsafe on this session")
+	}
+	return nil
+}
+
+// isSQLModeList reports whether s looks like a sql_mode value: identifiers
+// separated by commas, nothing else.
+func isSQLModeList(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '_', c == ',':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// removeSQLMode drops one element from a comma separated sql_mode value.
+func removeSQLMode(mode, drop string) (string, bool) {
+	parts := strings.Split(mode, ",")
+	out := make([]string, 0, len(parts))
+	changed := false
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		if strings.EqualFold(trimmed, drop) {
+			changed = true
+			continue
+		}
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return strings.Join(out, ","), changed
 }
 
 func (s *session) Close() {
@@ -354,6 +447,15 @@ func writeError(w *writer, reqID uint32, opcode byte, failIndex int, msg string)
 	w.u8(opcode)
 	w.i32(int32(failIndex))
 	w.str(msg)
+}
+
+// errText renders an error for the wire and for the log, with anything that
+// identifies the internal MySQL endpoint redacted.
+func (s *session) errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return truncateForLog(redact(fmt.Sprintf("%v", err), s.secrets...), 400)
 }
 
 func errText(err error) string {

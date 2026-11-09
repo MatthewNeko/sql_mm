@@ -7,11 +7,11 @@
 
   "log_level": "info",
 
-  "max_payload_bytes": 67108864,
+  "max_payload_bytes": 16777216,
 
   "allow_client_dsn": true,
-  "allowed_client_hosts": ["127.0.0.1"],
-  "allowed_client_databases": ["cs2kz"],
+  "allowed_client_hosts": ["*"],
+  "allowed_client_databases": ["cs2kz", "cs2kz_stats"],
   "fallback": {
     "host": "127.0.0.1",
     "port": 3306,
@@ -20,10 +20,10 @@
     "database": "cs2kz"
   },
 
-  "allowed_peers": ["203.0.113.0/24"],
+  "allowed_peers": [],
 
   "dial_timeout_seconds": 10,
-  "read_timeout_seconds": 60,
+  "read_timeout_seconds": 120,
   "write_timeout_seconds": 60,
   "query_timeout_seconds": 0,
 

@@ -40,6 +40,11 @@ func main() {
 	}
 	if *listen != "" {
 		cfg.Listen = *listen
+		// The plaintext guard in LoadConfig ran against the file's address;
+		// re-check after an override so -listen cannot widen the exposure.
+		if err := cfg.checkPlaintextListen(); err != nil {
+			logger.Fatalf("config: %v", err)
+		}
 	}
 
 	srv, err := NewServer(cfg, logger)

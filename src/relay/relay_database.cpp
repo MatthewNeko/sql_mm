@@ -257,6 +257,13 @@ std::string RelayConnection::Escape(const char *string)
     {
         return std::string();
     }
+
+    // Why the flag can be trusted to be absent: the relay clears
+    // NO_BACKSLASH_ESCAPES on its own session and refuses to open a session
+    // when it cannot (see normaliseSQLMode in relay-server/session.go). So
+    // "flag not set" means backslash escaping is valid on the far side, not
+    // merely "unknown". The bit is still honoured for relays built before that
+    // guarantee existed.
     return EscapeBytes(string, strlen(string), (Features() & Relay::FeatureNoBackslashEscapes) != 0);
 }
 

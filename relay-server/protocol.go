@@ -40,6 +40,11 @@ const (
 // Feature flags reported in ConnectOK. Must stay in sync with
 // sql_mm/src/relay/relay_protocol.h.
 const (
+	// flagNoBackslashEscapes is legacy: relays before the sql_mode
+	// normalisation used to report it whenever the MySQL server enforced
+	// NO_BACKSLASH_ESCAPES, and the plugin switched to '' quoting. Current
+	// relays refuse such a session instead (see session.normaliseSQLMode), so
+	// this is only ever sent to a client by an older build.
 	flagNoBackslashEscapes uint32 = 1 << 0
 )
 

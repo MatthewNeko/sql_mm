@@ -75,6 +75,53 @@ if [ "${PLUGIN_ONLY:-0}" != "1" ]; then
     cp "$ROOT/relay-server/README.md" "$DIST/relay/"
 fi
 
+# Regenerate the manifest instead of maintaining it by hand: a stale checksum is
+# worse than none, because it makes a correct binary look tampered with.
+echo "== manifest =="
+VERSION="$(sed -n 's/^#define SQLMM_VERSION "\(.*\)"/\1/p' "$ROOT/src/sql_mm.h" | head -1)"
+OS_NAME="$(. /etc/os-release 2>/dev/null && printf '%s' "$PRETTY_NAME")"
+SDK_COMMIT="$(git -C "$SDK_ROOT/hl2sdk-cs2" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+MMS_COMMIT="$(git -C "$MMS_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+
+{
+    printf 'SQLMM %s build\n' "${VERSION:-unknown}"
+    printf '=================\n\n'
+    printf 'Built       : %s (%s)\n' "$(date '+%Y-%m-%d %H:%M')" "${OS_NAME:-Linux}"
+    printf 'Plugin      : %s\n' "$(clang++ --version | head -1)"
+    printf 'Linker      : %s\n' "$(ld.lld --version 2>/dev/null | head -1 || echo lld)"
+    printf 'SDK         : hl2sdk-cs2 %s\n' "$SDK_COMMIT"
+    printf 'Metamod     : %s %s\n' "$MMS_COMMIT" "$MMS_ROOT"
+    if [ "${PLUGIN_ONLY:-0}" != "1" ]; then
+        printf 'Relay       : %s (CGO disabled, -trimpath -ldflags "-s -w")\n' "$(go version)"
+    fi
+    printf '\nChecksums (sha256)\n------------------\n'
+    ( cd "$DIST" && find addons relay -type f \( -name '*.so' -o -name 'sqlmm-relay-*' \) -print0 |
+        sort -z | xargs -0 sha256sum )
+    cat <<'EOF'
+
+Config lookup (plugin side)
+---------------------------
+sql_mm.cfg is resolved relative to the plugin binary, not the process working
+directory, because srcds is often started from game/bin/linuxsteamrt64. Order:
+  1. $SQLMM_RELAY_CONFIG
+  2. <plugin dir>/../../sql_mm.cfg        addons/sql_mm/sql_mm.cfg
+  3. <plugin dir>/sql_mm.cfg
+  4. ./addons/sql_mm/sql_mm.cfg
+  5. ./csgo/addons/sql_mm/sql_mm.cfg
+The log prints "relay config: <path>" when one is loaded, and the full list of
+candidates when none is found.
+
+Verified
+--------
+- go vet / go test: framing, handshake, PSK auth, downgrade refusal, peers,
+  concurrency, config guards (plaintext loopback-only, host allowlist by IP,
+  payload ceiling).
+- RFC 4231 / 5869 / 8439 test vectors for HMAC-SHA256, HKDF-SHA256, ChaCha20.
+- scripts/e2e-check.sh: shipped client code <-> shipped relay binary,
+  encrypted handshake + PING/PONG, wrong key rejected, plaintext refused.
+EOF
+} > "$DIST/BUILD.txt"
+
 echo "== done =="
 cd "$DIST"
 find . -type f -printf '%-60p %10s bytes\n' | sort
