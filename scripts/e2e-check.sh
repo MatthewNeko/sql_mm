@@ -10,14 +10,16 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RELAY="$ROOT/dist/relay/sqlmm-relay-linux-amd64"
+# RELAY lets CI (or a manual check) point at a binary that is not staged in
+# dist/ yet, e.g. the artifact a build job just produced.
+RELAY="${RELAY:-$ROOT/dist/relay/sqlmm-relay-linux-amd64}"
 PORT="${PORT:-19330}"
 PSK="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 WORK="$(mktemp -d)"
 STUB="$WORK/stub"
 
 trap 'rm -rf "$WORK"' EXIT
-[ -x "$RELAY" ] || { echo "build the relay first: scripts/build-linux.sh" >&2; exit 1; }
+[ -x "$RELAY" ] || { echo "no relay binary at $RELAY (scripts/build-linux.sh, or set RELAY=...)" >&2; exit 1; }
 
 mkdir -p "$STUB/tier0"
 # tier0's logging is the only engine dependency this code path has.

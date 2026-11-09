@@ -186,6 +186,31 @@ Build notes, in case you point it at a different SDK snapshot:
 - Link with `lld` (`-Wl,--no-gnu-unique` keeps KHook's `STB_GNU_UNIQUE` symbols
   from pinning the plugin in memory after `dlclose`).
 
+### CI
+
+`.github/workflows/build.yaml` builds three jobs; the relay job is independent
+of the plugin toolchain (no container, no AMBuild, no SDK):
+
+| job | runner | what it does |
+| --- | --- | --- |
+| `build-linux` | sniper SDK container | plugin `.so` |
+| `build-windows` | `windows-latest` | plugin `.dll` |
+| `build-relay` | matrix: `ubuntu-latest`, `windows-latest` | Go relay, built natively per OS |
+
+The relay job runs `gofmt -l`, `go mod tidy -diff`, `go vet`, `go test` (plus
+`-race` on Linux), then builds with `CGO_ENABLED=0 -trimpath -ldflags "-s -w"`,
+smoke-tests `-version` / `-genkey`, and finally runs `scripts/e2e-check.sh`
+against the binary it just built — the real C++ client code talking to the real
+server, which is the only way a field-order mismatch between the two sides gets
+caught. The Go version comes from `relay-server/go.mod`, so there is one place
+to bump it.
+
+Releases (`.github/workflows/build-release.yaml`) attach
+`sqlmm-relay-v<version>.tar.gz` containing both OS binaries, the config example
+and the relay README. The version is stamped via
+`-ldflags "-X main.relayVersion=..."`, which is why `relayVersion` in
+`relay-server/server.go` is a `var` and not a `const`.
+
 ## Migrating from 1.x
 
 1. Start `sqlmm-relay` somewhere the game servers can reach, configured with

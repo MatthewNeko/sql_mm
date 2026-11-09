@@ -15,7 +15,9 @@ import (
 	"unicode/utf8"
 )
 
-const relayVersion = "2.0.0"
+// relayVersion is a var, not a const, so release builds can stamp it with
+// `-ldflags "-X main.relayVersion=..."`. A const cannot be set by the linker.
+var relayVersion = "2.0.0"
 
 type logLevel int
 

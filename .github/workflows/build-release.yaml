@@ -30,9 +30,22 @@ jobs:
 
       - name: Archive builds
         run: |
-          mkdir releases
+          set -euo pipefail
+          mkdir -p releases
           tar -czvf "$GITHUB_WORKSPACE/releases/sql_mm-linux-v${{ inputs.version }}.tar.gz" -C artifacts/sql_mm-linux .
           (cd artifacts/sql_mm-windows && zip -r "$GITHUB_WORKSPACE/releases/sql_mm-windows-v${{ inputs.version }}.zip" .)
+
+      # The relay runs on a different machine from the plugin, so it gets its
+      # own archive containing both OS builds plus the documented config.
+      # Both artifacts carry the same README/config example; the second copy
+      # overwrites the first, which is what we want.
+      - name: Archive relay
+        run: |
+          set -euo pipefail
+          mkdir -p relay-pkg
+          cp -v artifacts/sqlmm-relay-linux-amd64/* relay-pkg/
+          cp -v artifacts/sqlmm-relay-windows-amd64/* relay-pkg/
+          tar -czvf "$GITHUB_WORKSPACE/releases/sqlmm-relay-v${{ inputs.version }}.tar.gz" -C relay-pkg .
 
       - name: Create tag
         run: |
@@ -47,4 +60,5 @@ jobs:
           files: |
             releases/sql_mm-linux-v${{ inputs.version }}.tar.gz
             releases/sql_mm-windows-v${{ inputs.version }}.zip
+            releases/sqlmm-relay-v${{ inputs.version }}.tar.gz
           generate_release_notes: true

@@ -23,11 +23,10 @@ jobs:
         run: |
           sed -i '/-security/d' /etc/apt/sources.list
           apt-get update -o Acquire::Check-Valid-Until=false
+          # No MySQL client headers: the plugin speaks its own wire protocol to
+          # the relay daemon now, so nothing links libmysqlclient.
           apt-get install -y --no-install-recommends --no-install-suggests \
-            git python3-pip default-libmysqlclient-dev lld
-          ls -l /usr/lib/x86_64-linux-gnu/libmysqlclient.a \
-                /usr/lib/x86_64-linux-gnu/libmariadbclient.a \
-                /usr/lib/x86_64-linux-gnu/libmariadb.a 2>/dev/null || true
+            git python3-pip lld
 
       - name: Allow git to read the workspace
         run: git config --global --add safe.directory '*'
@@ -107,3 +106,134 @@ jobs:
         with:
           name: sql_mm-windows
           path: ./build/package
+
+  # The relay is a separate program with its own toolchain (Go, no AMBuild,
+  # no SDK). It needs no container and no cross-compilation: each matrix entry
+  # builds natively, which is also what catches Windows-only breakage in the
+  # net/timer code paths.
+  build-relay:
+    name: Relay / ${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            ext: ""
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            ext: ".exe"
+    defaults:
+      run:
+        working-directory: relay-server
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reads the `go` directive out of go.mod, so the version the module asks
+      # for is the version CI uses. Bumping one bumps both.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: relay-server/go.mod
+          cache-dependency-path: relay-server/go.sum
+
+      - name: Check formatting
+        if: matrix.goos == 'linux'
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      # -diff does not write: it exits non-zero when go.mod/go.sum would change,
+      # which means someone edited imports and forgot to commit the result.
+      - name: Check modules are tidy
+        if: matrix.goos == 'linux'
+        run: go mod tidy -diff
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -count=1 ./...
+
+      # The session/handshake paths are concurrent by design; a plain test run
+      # can pass while a real race sits in wait.
+      - name: Test with race detector
+        if: matrix.goos == 'linux'
+        run: go test -count=1 -race ./...
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          v="${{ inputs.version }}"
+          if [ -z "$v" ]; then
+            v="dev+$(git rev-parse --short HEAD)"
+          fi
+          echo "value=$v" >>"$GITHUB_OUTPUT"
+
+      - name: Build
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          RELAY_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          name="sqlmm-relay-${GOOS}-${GOARCH}"
+          mkdir -p out
+          # Same flags as scripts/build-linux.sh: static, trimmed, stripped.
+          go build -trimpath -buildvcs=false \
+            -ldflags "-s -w -X main.relayVersion=${RELAY_VERSION}" \
+            -o "out/${name}${{ matrix.ext }}" .
+          # The config example ships next to the binary; a relay without it is
+          # a relay nobody can start.
+          cp config.example.json README.md out/
+          ls -l out
+
+      # A binary that builds but cannot boot is worse than a red build. -version
+      # exercises flag parsing + the version stamp, -genkey exercises entropy.
+      - name: Smoke test the binary
+        if: matrix.goos == 'linux'
+        shell: bash
+        env:
+          RELAY_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          bin="out/sqlmm-relay-${{ matrix.goos }}-${{ matrix.goarch }}"
+          out="$("$bin" -version)"
+          echo "$out"
+          case "$out" in
+            *"sqlmm-relay ${RELAY_VERSION}"*) ;;
+            *) echo "::error::-version did not report ${RELAY_VERSION}"; exit 1 ;;
+          esac
+          key="$("$bin" -genkey)"
+          if [[ ! "$key" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::-genkey did not print 64 hex characters"
+            exit 1
+          fi
+
+      # Cross-language check: the real C++ client code against the binary that
+      # was just built. Unit tests on either side cannot catch a field-order
+      # mismatch between them; this does.
+      - name: End-to-end handshake
+        if: matrix.goos == 'linux'
+        shell: bash
+        run: |
+          # Invoked through bash: the scripts are checked in without the
+          # executable bit (Windows checkouts drop it), so ./script.sh fails.
+          RELAY="$PWD/out/sqlmm-relay-${{ matrix.goos }}-${{ matrix.goarch }}" \
+            bash ../scripts/e2e-check.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sqlmm-relay-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: relay-server/out
+          if-no-files-found: error
+

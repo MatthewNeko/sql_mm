@@ -20,6 +20,9 @@ SDK_ROOT="${HL2SDK_ROOT:-/mnt/h/code/CS2PROJECT/cs2kz-metamod/cs2kz-metamod}"
 MMS_ROOT="${MMS_PATH:-$SDK_ROOT/metamod-source}"
 BUILD_DIR="$ROOT/build-linux"
 DIST="$ROOT/dist"
+# Read the version once: the relay binary is stamped with it and the manifest
+# reports it, and those two must not disagree.
+VERSION="$(sed -n 's/^#define SQLMM_VERSION "\(.*\)"/\1/p' "$ROOT/src/sql_mm.h" | head -1)"
 
 if [ ! -d "$SDK_ROOT/hl2sdk-cs2" ]; then
     echo "hl2sdk-cs2 not found under $SDK_ROOT (set HL2SDK_ROOT)" >&2
@@ -63,13 +66,19 @@ cp "$ROOT/cfg/sql_mm.cfg" "$DIST/addons/sql_mm/"
 if [ "${PLUGIN_ONLY:-0}" != "1" ]; then
     echo "== relay =="
     mkdir -p "$DIST/relay"
+    RELAY_LDFLAGS='-s -w'
+    # Stamped only when the header has a version; an empty -X would replace the
+    # default with "" and make -version print nothing useful.
+    [ -n "$VERSION" ] && RELAY_LDFLAGS="-s -w -X main.relayVersion=$VERSION"
     (
         cd "$ROOT/relay-server"
         # Static, stripped, reproducible: copy to any Linux box and run.
         CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 \
-            go build -trimpath -ldflags '-s -w' -o "$DIST/relay/sqlmm-relay-linux-amd64" .
+            go build -trimpath -buildvcs=false -ldflags "$RELAY_LDFLAGS" \
+            -o "$DIST/relay/sqlmm-relay-linux-amd64" .
         CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
-            go build -trimpath -ldflags '-s -w' -o "$DIST/relay/sqlmm-relay-windows-amd64.exe" .
+            go build -trimpath -buildvcs=false -ldflags "$RELAY_LDFLAGS" \
+            -o "$DIST/relay/sqlmm-relay-windows-amd64.exe" .
     )
     cp "$ROOT/relay-server/config.example.json" "$DIST/relay/"
     cp "$ROOT/relay-server/README.md" "$DIST/relay/"
@@ -78,7 +87,6 @@ fi
 # Regenerate the manifest instead of maintaining it by hand: a stale checksum is
 # worse than none, because it makes a correct binary look tampered with.
 echo "== manifest =="
-VERSION="$(sed -n 's/^#define SQLMM_VERSION "\(.*\)"/\1/p' "$ROOT/src/sql_mm.h" | head -1)"
 OS_NAME="$(. /etc/os-release 2>/dev/null && printf '%s' "$PRETTY_NAME")"
 SDK_COMMIT="$(git -C "$SDK_ROOT/hl2sdk-cs2" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 MMS_COMMIT="$(git -C "$MMS_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -92,7 +100,8 @@ MMS_COMMIT="$(git -C "$MMS_ROOT" rev-parse --short HEAD 2>/dev/null || echo unkn
     printf 'SDK         : hl2sdk-cs2 %s\n' "$SDK_COMMIT"
     printf 'Metamod     : %s %s\n' "$MMS_COMMIT" "$MMS_ROOT"
     if [ "${PLUGIN_ONLY:-0}" != "1" ]; then
-        printf 'Relay       : %s (CGO disabled, -trimpath -ldflags "-s -w")\n' "$(go version)"
+        printf 'Relay       : %s, version %s (CGO disabled, -trimpath, -ldflags "%s")\n' \
+            "$(go version)" "${VERSION:-unstamped}" "${RELAY_LDFLAGS:--s -w}"
     fi
     printf '\nChecksums (sha256)\n------------------\n'
     ( cd "$DIST" && find addons relay -type f \( -name '*.so' -o -name 'sqlmm-relay-*' \) -print0 |

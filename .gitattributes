@@ -1,0 +1,10 @@
+# These files are executed or parsed on Linux CI runners. A CRLF checkout there
+# fails with "bash: $'\r': command not found" (or a YAML parse error), which
+# looks like a code bug and is not one. Force LF regardless of the contributor's
+# core.autocrlf. Scoped to the affected extensions on purpose: renormalising the
+# vendored C sources would produce a huge, pointless diff.
+*.sh   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.go   text eol=lf
+*.json text eol=lf
