@@ -1,10 +1,8 @@
 #include <stdio.h>
+#include <string>
 
 #ifdef WIN32
 #include <WinSock2.h>
-#include <mysql.h>
-#else
-#include <mysql/mysql.h>
 #endif
 
 #include "sql_mm.h"
@@ -15,8 +13,10 @@
 
 #include "common/interface.h"
 
-#include "mysql/mysql_database.h"
-#include "mysql/mysql_client.h"
+#include "relay/relay_client.h"
+#include "relay/relay_config.h"
+#include "relay/relay_database.h"
+#include "relay/relay_socket.h"
 
 #include "sqlite/sqlite_database.h"
 #include "sqlite/sqlite_client.h"
@@ -34,9 +34,9 @@ IVEngineServer *engine = nullptr;
 CModule *serverModule = nullptr;
 ISQLInterface *g_sqlInterface = nullptr;
 
-// MySQL
+// MySQL (through the relay server; no libmysqlclient in this binary)
 IMySQLClient *g_mysqlClient = nullptr;
-std::vector<MySQLConnection *> g_vecMysqlConnections;
+std::vector<RelayConnection *> g_vecMysqlConnections;
 
 // SQLite
 ISQLiteClient *g_sqliteClient = nullptr;
@@ -79,13 +79,25 @@ bool SQLPlugin::Load(PluginId id, ISmmAPI *ismm, char *error, size_t maxlen, boo
 
     META_CONPRINTF("Starting plugin.\n");
 
-    if (mysql_library_init(0, NULL, NULL))
+    // MySQL is reached through a relay daemon, so the plugin only needs a
+    // socket stack, not the client library.
+    if (!RelaySocket::GlobalInit())
     {
-        snprintf(error, maxlen, "Failed to initialize mysql library\n");
+        snprintf(error, maxlen, "Failed to initialize the socket layer\n");
         return false;
     }
+    // Load and validate the relay config now, so a bad key shows up at boot
+    // instead of as a stream of failed queries later.
+    const RelayConfig &relayCfg = RelayConfig::Get();
+    std::string relayConfigError;
+    if (!relayCfg.Validate(relayConfigError))
+    {
+        snprintf(error, maxlen, "SQLMM relay config: %s\n", relayConfigError.c_str());
+        return false;
+    }
+
     serverModule = new CModule(GAMEBIN, "server");
-    g_mysqlClient = new CMySQLClient();
+    g_mysqlClient = new CRelayClient();
     g_sqliteClient = new SqClient();
     g_sqlInterface = new SQLInterface();
     // KHook::Virtual dereferences the pointer it is given to reach the vtable, so hooking a bare
@@ -109,7 +121,7 @@ bool SQLPlugin::Unload(char *error, size_t maxlen)
         g_vecSqliteConnections.back()->Destroy();
     }
 
-    mysql_library_end();
+    RelaySocket::GlobalShutdown();
 
     delete serverModule;
     delete g_mysqlClient;
@@ -143,7 +155,7 @@ KHook::Return<void> SQLPlugin::Hook_ServerGamePostSimulate(IGameSystem *, const 
     }
     g_bInFrame = false;
 
-    for (auto connection : std::vector<MySQLConnection *>(g_vecMysqlConnections))
+    for (auto connection : std::vector<RelayConnection *>(g_vecMysqlConnections))
     {
         if (connection->IsDestroyed())
         {

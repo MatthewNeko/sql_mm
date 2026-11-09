@@ -24,7 +24,9 @@
 #include <igameevents.h>
 #include "igamesystem.h"
 
-#define SQLMM_VERSION "1.3.4.2"
+// 2.0.0: MySQL connections are proxied through the relay daemon
+// (relay-server/); the plugin no longer links against libmysqlclient.
+#define SQLMM_VERSION "2.0.0"
 
 class SQLPlugin : public ISmmPlugin, public IMetamodListener
 {

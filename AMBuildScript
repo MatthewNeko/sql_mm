@@ -15,12 +15,14 @@ def additional_defines(context, binary, sdk):
   ]
 
 def additional_includes(context, binary, sdk):
-  return [
-    # Path should be absolute only!
-    # os.path.join(sdk['path'], 'game', 'server'),
-    # os.path.join(sdk['path'], 'public', 'entity2'),
-    # 'D:/absolute/path/to/include/folder/'
-  ]
+  # ISmmPlugin.h does '#include "sourcehook.h"'. Metamod's own AMBuildScript
+  # adds core/sourcehook for that, but this template only adds mms_root/core.
+  # Newer Metamod:Source trees (the ones trimmed for Source 2) drop SourceHook
+  # entirely, so only add the path when it is actually there.
+  sourcehook = os.path.join(MMSPlugin.mms_root, 'core', 'sourcehook')
+  if os.path.isdir(sourcehook):
+    return [sourcehook]
+  return []
 
 def HasLLDLinker():
   result = shutil.which('lld')
@@ -302,9 +304,17 @@ class MMSPluginConfig(object):
 
     if sdk['source2']:
       cxx.defines += ['META_IS_SOURCE2']
+      # Older CS2 SDK snapshots ship these as tier0_perproject/*, current ones
+      # moved them to tier1/*. Pick whichever layout the SDK on disk has,
+      # otherwise the build dies with a missing-source error that has nothing
+      # to do with this plugin.
+      if os.path.exists(os.path.join(sdk['path'], 'tier0_perproject', 'convar.cpp')):
+        convar_src = os.path.join(sdk['path'], 'tier0_perproject', 'convar.cpp')
+      else:
+        convar_src = os.path.join(sdk['path'], 'tier1', 'convar.cpp')
       binary.sources += [
         os.path.join(sdk['path'], 'public', 'tier0', 'memoverride.cpp'),
-        os.path.join(sdk['path'], 'tier0_perproject', 'convar.cpp'),
+        convar_src,
       ]
 
     SdkHelpers.configureCxx(context, binary, sdk)

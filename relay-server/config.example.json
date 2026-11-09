@@ -1,0 +1,32 @@
+{
+  "listen": "0.0.0.0:9330",
+
+  "encryption": "psk",
+  "psk": "paste-the-output-of-sqlmm-relay--genkey-here",
+  "token": "",
+
+  "log_level": "info",
+
+  "max_payload_bytes": 67108864,
+
+  "allow_client_dsn": true,
+  "allowed_client_hosts": ["127.0.0.1"],
+  "allowed_client_databases": ["cs2kz"],
+  "fallback": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "cs2",
+    "pass": "secret",
+    "database": "cs2kz"
+  },
+
+  "allowed_peers": ["203.0.113.0/24"],
+
+  "dial_timeout_seconds": 10,
+  "read_timeout_seconds": 60,
+  "write_timeout_seconds": 60,
+  "query_timeout_seconds": 0,
+
+  "max_sessions": 128,
+  "max_sessions_per_peer": 4
+}

@@ -43,6 +43,12 @@ for task in MMSPlugin.binaries:
 
 builder.AddCopy(os.path.join(builder.buildPath, MMSPlugin.plugin_name + '.vdf'), metamod_folder)
 
+# Ship the relay client config next to the binaries so a fresh install has the
+# expected keys in front of it. Existing customised copies are not touched by an
+# in-place server update; AMBuild only writes into the package staging folder.
+plugin_folder = builder.AddFolder(os.path.join('addons', MMSPlugin.plugin_name))
+builder.AddCopy(os.path.join(builder.sourcePath, 'cfg', 'sql_mm.cfg'), plugin_folder)
+
 # Generate PDB info.
 with open(os.path.join(builder.buildPath, 'pdblog.txt'), 'wt') as fp:
   for line in pdb_list:

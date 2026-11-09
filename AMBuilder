@@ -1,19 +1,6 @@
 # vim: set sts=2 ts=8 sw=2 tw=99 et ft=python:
 import os
 
-# default-libmysqlclient-dev resolves to MariaDB on Debian derivatives (Steam Runtime included),
-# which names the static library differently depending on the distro and version.
-def FindMySQLStaticLib():
-  libdir = '/usr/lib/x86_64-linux-gnu'
-  candidates = ['libmysqlclient.a', 'libmariadbclient.a', 'libmariadb.a']
-  for name in candidates:
-    path = os.path.join(libdir, name)
-    if os.path.exists(path):
-      return path
-  raise Exception('None of {} found in {}. Install default-libmysqlclient-dev.'.format(
-    ', '.join(candidates), libdir))
-
-
 # Here only one sdk should be available to generate only one executable in the end,
 # as multi-sdk loading isn't supported out of the box by metamod, and would require specifying the full path in the vdf
 # which in the end would ruin the multi-platform (unix, win etc) loading by metamod as it won't be able to append platform specific extension
@@ -31,14 +18,23 @@ for sdk_target in MMSPlugin.sdk_targets:
 
   binary.sources += [
     'src/sql_mm.cpp',
-    
-    'src/mysql/operations/mysql_connect.cpp',
-    'src/mysql/operations/mysql_query.cpp',
-    'src/mysql/operations/mysql_transact.cpp',
-    'src/mysql/mysql_database.cpp',
-    'src/mysql/mysql_result.cpp',
-    'src/mysql/mysql_client.cpp',
-    
+
+    # MySQL goes through the relay daemon; these files only implement the
+    # client side of the wire protocol. No libmysqlclient is linked.
+    'src/relay/relay_client.cpp',
+    'src/relay/relay_config.cpp',
+    'src/relay/relay_database.cpp',
+    'src/relay/relay_link.cpp',
+    'src/relay/relay_operations.cpp',
+    'src/relay/relay_result.cpp',
+    'src/relay/relay_socket.cpp',
+
+    # Session crypto. Hand written on purpose: linking OpenSSL into a Metamod
+    # plugin means shipping/finding libcrypto on every game host.
+    'src/relay/crypto/chacha20.cpp',
+    'src/relay/crypto/relay_cipher.cpp',
+    'src/relay/crypto/sha256.cpp',
+
     'vendor/sqlite-source/sqlite3.c',
     'src/sqlite/operations/sqlite_connectop.cpp',
     'src/sqlite/operations/sqlite_queryop.cpp',
@@ -61,13 +57,12 @@ for sdk_target in MMSPlugin.sdk_targets:
       'src/utils/plat_linux.cpp'
     ]
     binary.compiler.postlink += [
-      FindMySQLStaticLib(),
       '-ldl',
       '-lz',
       '-lpthread',
       '-lm',
+      '-lrt',
     ]
-    binary.compiler.postlink += ['-lrt', '-lssl', '-lcrypto']
 
   if binary.compiler.family == 'gcc' or binary.compiler.family == 'clang':
     binary.compiler.cxxflags += ['-fno-rtti']
@@ -77,17 +72,19 @@ for sdk_target in MMSPlugin.sdk_targets:
       'src/utils/plat_win.cpp'
     ]
     binary.compiler.defines += ['WIN32_LEAN_AND_MEAN']
-    binary.compiler.cxxincludes += [
-      os.path.join(builder.sourcePath, 'vendor', 'mysql', 'include'),
-    ]
     binary.compiler.postlink += [
-      'crypt32.lib',
-      os.path.join(builder.sourcePath, 'vendor', 'mysql', 'lib', 'mysqlclient.lib'),
+      'ws2_32.lib',
     ]
 
-  binary.custom = [builder.tools.Protoc(protoc = sdk_target.protoc, sources = [
-    os.path.join(sdk['path'], 'common', 'network_connection.proto'),
-  ])]
+  # engine2 headers (pulled in by ISource2Server / INetworkGameServerBase) include
+  # the generated netmessages protobufs, and those pull in valveextensions, so
+  # generate every proto in the SDK's common/ rather than chasing imports one
+  # compile error at a time.
+  proto_dir = os.path.join(sdk['path'], 'common')
+  proto_sources = [os.path.join(proto_dir, name)
+                   for name in sorted(os.listdir(proto_dir))
+                   if name.endswith('.proto')]
+  binary.custom = [builder.tools.Protoc(protoc = sdk_target.protoc, sources = proto_sources)]
 
   nodes = builder.Add(binary)
   MMSPlugin.binaries += [nodes]

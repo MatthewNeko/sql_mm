@@ -3,3 +3,9 @@
 /build*
 /winbuild
 /package
+/dist
+
+# Go relay binaries and local config
+relay-server/sqlmm-relay
+relay-server/sqlmm-relay.exe
+relay-server/config.json
